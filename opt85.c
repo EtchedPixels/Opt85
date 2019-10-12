@@ -15,7 +15,7 @@ struct label {
 struct effect {
 	struct instruction *prev, *next;
 	uint32_t need, set;
-	uint16_t value[8];	/* A B C D E H L */
+	uint16_t value[9];	/* X A B C D E H L PSW */
 	/* We can do ranges and more later */
 #define VALUE_KNOWN	0x0100
 	uint32_t flags;
@@ -79,11 +79,11 @@ struct optab {
 #define REG_E		5
 #define REG_H		6
 #define REG_L		7
-#define MEM_HL		8
-#define MEMORY		9
-#define REG_SP		10
-#define MEM_HL_W	11
-#define REG_PSW		12
+#define REG_PSW		8
+#define MEM_HL		9
+#define MEMORY		10
+#define REG_SP		12
+#define MEM_HL_W	12
 #define SIDEEFFECT	13
 
 #define REGM_A		(1 << REG_A)
@@ -106,8 +106,9 @@ struct optab {
 /* For barrier cases like jumping */
 #define REGM_ALL	0xFFFF
 
+/* We don't track values for PSW yet but we track usage */
 #define KEEPMASK	(SIDEEFFECTM | MEMM_HL | MEMORYM | MEMM_HL_W | REGM_SP)
-#define TRACKED		(REGM_A | REGM_B | REGM_C | REGM_D | REGM_E | REGM_H | REGM_L)
+#define TRACKED		(REGM_A | REGM_B | REGM_C | REGM_D | REGM_E | REGM_H | REGM_L | REGM_PSW)
 
 struct optab ops[] = {
 	/* For these the immediate form *MUST* follow the non immediate */
@@ -235,8 +236,8 @@ static char regname(int reg)
 {
 	if (reg == MEM_HL)
 		return 'M';
-	if (reg <= REG_L)
-		return "?ABCDEHL"[reg];
+	if (reg <= REG_PSW)
+		return "?ABCDEHLF"[reg];
 	fprintf(stderr, "%d: bad regname %d\n", linenum, reg);
 	exit(1);
 }
@@ -362,7 +363,7 @@ static void invalidate_regs(struct effect *e)
 	e->need = REGM_ALL;
 }
 
-struct instruction *new_instruction(void)
+static struct instruction *make_instruction(void)
 {
 	struct instruction *i = zalloc(sizeof(struct instruction));
 	struct effect *e = zalloc(sizeof(struct effect));
@@ -370,6 +371,12 @@ struct instruction *new_instruction(void)
 	i->next = e;
 	e->next = NULL;
 	e->prev = i;
+	return i;
+}
+
+struct instruction *new_instruction(void)
+{
+	struct instruction *i = make_instruction();
 
 	if (codetail) {
 		i->prev = codetail->next;
@@ -380,6 +387,19 @@ struct instruction *new_instruction(void)
 		codetail = codehead = i;
 	}
 	return i;
+}
+
+struct instruction *append_instruction(struct instruction *i)
+{
+	struct instruction *n = make_instruction();
+	n->next->next = i->next->next;
+	i->next->next = n;
+	n->prev = i->next;
+	if (n->next->next)
+		n->next->next->prev = n->next;
+	else
+		codetail = n;
+	return n;
 }
 
 struct label *new_label(void)
@@ -604,6 +624,9 @@ static void parse_instruction(struct instruction *i)
 		else if (o->flags & OP_SPAIR) {
 			ParsePair(&l);
 			i->sr = l;
+			/* DAD has an implicit destination */
+			if (strcasecmp(op, "DAD") == 0)
+				i->dr = REG_H;
 			i->prev->need |= PairMask(l);
 		}
 		/* Arithmetic op without constant */
@@ -722,6 +745,9 @@ static void compute_effects(struct instruction *i)
 		}
 	}
 
+	/* TODO: when we know the result we should consider swapping
+	   a lot of these for loads and adjusting the prev->need so we
+	   can run a second elimination pass ? */
 	/* INC and DEC */
 	if (strcasecmp(op, "DCR") == 0 && know_reg_value(i->prev, i->dr))
 		set_reg_value(i->next, i->dr,
@@ -841,6 +867,50 @@ static void make_op(struct instruction *i, const char *m)
 	char *p = zalloc(8);
 	sprintf(p, "%s %c,%c", m, regname(i->dr), regname(i->sr));
 	i->op = p;
+	i->opcode = m;
+	i->opinfo = find_operation(m);
+}
+
+static void make_op1(struct instruction *i, const char *m)
+{
+	char *p = zalloc(8);
+	sprintf(p, "%s %c", m, regname(i->dr));
+	i->op = p;
+	i->opcode = m;
+	i->opinfo = find_operation(m);
+}
+
+static void make_op2_r(struct instruction *i, const char *m, int rd, int rs)
+{
+	char *p = zalloc(8);
+	sprintf(p, "%s %c,%c", m, regname(rd), regname(rs));
+	i->op = p;
+	i->opcode = m;
+	i->opinfo = find_operation(m);
+}
+
+/* The caller is responsible for fixing up the register values resulting
+   in any split: see adjust_immed16() */
+static struct instruction *add_op1(struct instruction *i, const char *m)
+{
+	struct instruction *n = append_instruction(i);
+	make_op1(n, m);
+	compute_effects(i);
+	compute_effects(n);
+	i->next->need = i->prev->need & ~i->next->set;
+	n->next->need = n->prev->need & ~n->next->set;
+	return n;
+}
+
+static struct instruction * add_op2_r(struct instruction *i, const char *m, int rd, int rs)
+{
+	struct instruction *n = append_instruction(i);
+	make_op2_r(n, m, rd, rs);
+	compute_effects(i);
+	compute_effects(n);
+	i->next->need = i->prev->need & ~i->next->set;
+	n->next->need = n->prev->need & ~n->next->set;
+	return n;
 }
 
 static void eliminate_instruction(struct instruction *i)
@@ -890,12 +960,20 @@ static void adjust_immed8(void)
 	struct instruction *i = codehead;
 	int r;
 	while (i) {
+		int kdr = know_reg_value(i->prev, i->dr);
 		/* Remove anybody who loads a preloaded value */
-		if (i->opinfo->flags & OP_MVI) {
-			if (know_reg_value(i->prev, i->dr) &&
-				reg_value(i->prev, i->dr) == i->addrconst) {
+		/* Use icr/dcr otherwise - should be safe but needs review
+		   of compiler rules. We might need to flag this with
+		   a PSW check but I don't think ack generates delayed
+		   conditionals this way */
+		if ((i->opinfo->flags & OP_MVI) && kdr) {
+			uint8_t v = reg_value(i->prev, i->dr);
+			if (v == (uint8_t)i->addrconst)
 				eliminate_instruction(i);
-			}
+			else if (v == (uint8_t)(i->addrconst + 1))
+				make_op1(i, "DCR");
+			else if (v == (uint8_t)(i->addrconst - 1))
+				make_op1(i, "INR");
 		}
 		if (i->opinfo->flags & OP_MOV) {
 			if (know_reg_value(i->prev, i->dr) &&
@@ -917,6 +995,94 @@ static void adjust_immed8(void)
 				/* Convert to normal op from immediate */
 				i->opinfo--;
 				make_op(i, i->opinfo->op);
+			}
+		}
+		i = i->next->next;
+	}
+}
+
+/* For 16bit we really need labels sorted so we can spot label relative
+   inx/dex for fixup and 16bit duplicates. For now we can only do numeric
+   constants */
+static void adjust_immed16(void)
+{
+	struct instruction *i = codehead;
+	struct instruction *n;
+	while (i) {
+		int kdr = know_pair_value(i->prev, i->dr);
+		/* Optimise LXI if we can */
+		if (strcasecmp(i->opcode, "LXI") == 0 && i->addrconst != CONST_UNKNOWN ) {
+			uint16_t v;
+			if (kdr)
+				v = reg_value(i->prev, i->dr);
+
+			if (kdr && v == (uint8_t)i->addrconst)
+				eliminate_instruction(i);
+			else if (kdr && v == (uint16_t)(i->addrconst + 1))
+				make_op1(i, "DEX");
+			else if (kdr && v == (uint16_t)(i->addrconst - 1))
+				make_op1(i, "INX");
+			else if (kdr && v == (uint16_t)(i->addrconst + 2)) {
+				make_op1(i, "DEX");
+				set_pair_value(i->next, REG_H, pair_value(i->prev, REG_H) - 1);
+				n = add_op1(i, "DEX");
+				set_pair_value(n->next, REG_H, pair_value(i->prev, REG_H) - 1);
+			} else if (kdr && v == (uint16_t)(i->addrconst - 2)) {
+				make_op1(i, "INX");
+				set_pair_value(i->next, REG_H, pair_value(i->prev, REG_H) + 1);
+				n = add_op1(i, "INX");
+				set_pair_value(n->next, REG_H, pair_value(i->prev, REG_H) + 1);
+			} else {
+				/* Look for our register values in a pair of others.
+				   It's only a win if they are both present and we are
+				   not exchanging halves with ourself */
+				int rl = find_reg_value(i->prev, i->addrconst & 0xFF);
+				int rh = find_reg_value(i->prev, i->addrconst >> 8);
+				/* We get in a mess if we want to load de from ed */
+				if (rl && rh && !(rl == i->dr && rh == i->dr + 1)) {
+					/* If the low part is in the register
+					   we are setting up do it first */
+					if (rl == i->dr || rl == i->dr + 1) {
+						make_op2_r(i, "MOV", i->dr+1, rl);
+						set_reg_value(i->next, i->dr+1, i->addrconst & 0xFF);
+						clear_reg_value(i->next, i->dr);
+						n = add_op2_r(i, "MOV", i->dr, rh);
+						set_pair_value(n->next, i->dr, i->addrconst);
+					} else {
+						make_op2_r(i, "MOV", i->dr, rh);
+						n = add_op2_r(i, "MOV", i->dr+1, rl);
+						set_reg_value(i->next, i->dr+1, i->addrconst & 0xFF);
+						clear_reg_value(i->next, i->dr);
+						set_pair_value(n->next, i->dr, i->addrconst);
+					}
+				}
+			}
+		}
+		else if (strcasecmp(i->opcode, "DAD") == 0 && know_pair_value(i->prev, i->sr)) {
+			/* Not much to say here. At this level we don't
+			   eliminate constant maths but we can fix up
+			   DAD to INX and DEX */
+			uint16_t v = pair_value(i->prev, i->sr);
+			/* Need to review these for flags */
+			if (!(i->next->need & REG_PSW)) {
+				if (v == 0)
+					eliminate_instruction(i);
+				if (v == 1)
+					make_op1(i, "INX");
+				if (v == -1)
+					make_op1(i, "DEX");
+				if (v == 2) {
+					make_op1(i, "INX");
+					set_pair_value(i->next, REG_H, pair_value(i->prev, REG_H) + 1);
+					n = add_op1(i, "INX");
+					set_pair_value(n->next, REG_H, pair_value(i->prev, REG_H) + 1);
+				}
+				if (v == -2) {
+					make_op1(i, "DEX");
+					set_pair_value(i->next, REG_H, pair_value(i->prev, REG_H) - 1);
+					n = add_op1(i, "DEX");
+					set_pair_value(n->next, REG_H, pair_value(i->prev, REG_H) - 1);
+				}
 			}
 		}
 		i = i->next->next;
@@ -1066,6 +1232,8 @@ int main(int argc, char *argv[])
 	/* Constant loads to register for 8bit operations */
 	printf("Immed8:\n");
 	adjust_immed8();
+	printf("Immed16:\n");
+	adjust_immed16();
 	/* Look for assignments we can move about and make into pair loads */
 	/* TODO move_assignments(); */
 	/* Check our fp/sp biasing model is consistent */
