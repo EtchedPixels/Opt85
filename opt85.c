@@ -28,6 +28,7 @@ struct instruction {
 	struct label *lnext;
 	struct label *label;
 	const char *op;
+	const char *opcode;
 	struct optab *opinfo;
 	const char *insn;
 	uint8_t sr, dr;
@@ -105,7 +106,7 @@ struct optab {
 /* For barrier cases like jumping */
 #define REGM_ALL	0xFFFF
 
-#define KEEPMASK	(SIDEEFFECTM | MEMM_HL | MEMORYM | MEMM_HL_W | REGM_SP | REGM_PSW)
+#define KEEPMASK	(SIDEEFFECTM | MEMM_HL | MEMORYM | MEMM_HL_W | REGM_SP)
 #define TRACKED		(REGM_A | REGM_B | REGM_C | REGM_D | REGM_E | REGM_H | REGM_L)
 
 struct optab ops[] = {
@@ -230,6 +231,16 @@ static void error(const char *p)
 	exit(1);
 }
 
+static char regname(int reg)
+{
+	if (reg == MEM_HL)
+		return 'M';
+	if (reg <= REG_L)
+		return "?ABCDEHL"[reg];
+	fprintf(stderr, "%d: bad regname %d\n", linenum, reg);
+	exit(1);
+}
+
 void badreg8(void)
 {
 	error("Expected A,B,C,D,E,H,L or M");
@@ -245,7 +256,7 @@ static void print_regmap(unsigned int m)
 	int i;
 	for (i = REG_A; i <= REG_L; i++) {
 		if (m & (1 << i))
-			putchar(" ABCDEHL"[i]);
+			putchar(regname(i));
 		else
 			putchar('-');
 	}
@@ -255,7 +266,7 @@ static void print_values(struct effect *e)
 {
 	int i;
 	for (i = REG_A; i <= REG_L; i++) {
-		putchar(" ABCDEHL"[i]);
+		putchar(regname(i));
 		if (e->value[i] & VALUE_KNOWN)
 			printf("%02X", e->value[i] & 0xFF);
 		else
@@ -271,15 +282,6 @@ static char *do_strtok(char *m, char *e)
 	return p;
 }
 
-static char regname(int reg)
-{
-	if (reg == MEM_HL)
-		return 'M';
-	if (reg <= REG_L)
-		return "?ABCDEHL"[reg];
-	fprintf(stderr, "%d: bad regname %d\n", linenum, reg);
-	exit(1);
-}
 
 /*
  * Value tracking:
@@ -291,8 +293,16 @@ static uint16_t reg_value(struct effect *e, int reg)
 {
 	if (e->value[reg] & VALUE_KNOWN)
 		return e->value[reg] & 0xFF;
+	fprintf(stderr, "Regval %c is not known.\n", regname(reg));
 	error("attempt to consume unknown value");
 	return 0;
+}
+
+static void clear_reg_value(struct effect *e, int reg)
+{
+	if (reg > REG_L)
+		return;
+	e->value[reg] = 0;
 }
 
 static void set_reg_value(struct effect *e, int reg, int v)
@@ -332,6 +342,9 @@ static int know_pair_value(struct effect *e, int reg)
 static int find_reg_value(struct effect *e, int val)
 {
 	int i;
+	if (val == CONST_UNKNOWN)
+		return 0;
+
 	for (i = REG_A; i <= REG_L; i++) {
 		if (know_reg_value(e, i)
 		    && reg_value(e, i) == (val & 0xFF))
@@ -519,7 +532,7 @@ static void parse_instruction(struct instruction *i)
 {
 	char *p = strdup(i->op);
 	char *op = strtok(p, " \t");
-	int l, r, n;
+	int l, r;
 	struct optab *o;
 
 	if (op == NULL)
@@ -536,6 +549,7 @@ static void parse_instruction(struct instruction *i)
 	i->prev->need = o->imask;
 	i->next->set = o->omask;
 	i->opinfo = o;
+	i->opcode = op;		/* FIXME: would be better as a code */
 
 	/* Register to register move, 8 bit */
 	if (o->flags & OP_MOV) {
@@ -543,11 +557,8 @@ static void parse_instruction(struct instruction *i)
 		/* We need the source, we set the dest */
 		i->prev->need |= (1 << r);
 		i->next->set |= (1 << l);
-		i->sr = l;
-		i->dr = r;
-		/* Propagate known constants */
-		if (know_reg_value(i->prev, r))
-			set_reg_value(i->next, l, reg_value(i->prev, r));
+		i->sr = r;
+		i->dr = l;
 	}
 	/* Immediate to register move, 8bit */
 	if (o->flags & OP_MVI) {
@@ -555,8 +566,6 @@ static void parse_instruction(struct instruction *i)
 		i->next->set = (1 << l);
 		i->dr = l;
 		i->addrconst = r;
-		if (r != CONST_UNKNOWN)
-			set_reg_value(i->next, l, r);
 	}
 	/* General immediates */
 	if (o->flags & OP_IMMED) {
@@ -600,8 +609,8 @@ static void parse_instruction(struct instruction *i)
 		/* Arithmetic op without constant */
 		else if (o->flags & OP_AOP) {
 			ParseR8M(&l);
-			i->sr = REG_A;
-			i->dr = l;
+			i->dr = REG_A;
+			i->sr = l;
 			i->prev->need |= (1 << l);
 		}
 	}
@@ -634,8 +643,33 @@ static void parse_instruction(struct instruction *i)
 	   remove any */
 	if (o->flags & (OP_RET | OP_CALL | OP_BRA))
 		i->next->set |= SIDEEFFECTM;
+}
 
-	/* Next calculate the stack/frame offset */
+
+/*
+ *	Compute the actual register effects of an instruction
+ */
+static void compute_effects(struct instruction *i)
+{
+	const char *op = i->opcode;
+	int n;
+
+	if (i->opinfo->flags & OP_MOV) {
+		/* Propagate known constants */
+		if (know_reg_value(i->prev, i->sr))
+			set_reg_value(i->next, i->dr, reg_value(i->prev, i->sr));
+	}
+	if (i->opinfo->flags & OP_MVI)
+		set_reg_value(i->next, i->dr, i->addrconst);
+
+	if (i->opinfo->flags & OP_IMMED) {
+		if (i->opinfo->flags & OP_AOP)
+			set_reg_value(i->next, i->dr, i->addrconst);
+		else
+			set_pair_value(i->next, i->dr, i->addrconst);
+	}
+		
+	/* Calculate the stack/frame offset */
 	if (strcasecmp(op, "PUSH") == 0)
 		if (i->spbias != BIAS_UNKNOWN)
 			i->spbias += 2;
@@ -707,32 +741,37 @@ static void parse_instruction(struct instruction *i)
 	    && know_reg_value(i->prev, REG_A))
 		set_reg_value(i->next, i->dr,
 			      reg_value(i->prev,
-					REG_A) & reg_value(i->next,
+					REG_A) & reg_value(i->prev,
 							   i->sr));
 	if (strcasecmp(op, "ORA") == 0 && know_reg_value(i->prev, i->sr)
 	    && know_reg_value(i->prev, REG_A))
 		set_reg_value(i->next, i->dr,
 			      reg_value(i->prev,
-					REG_A) | reg_value(i->next,
+					REG_A) | reg_value(i->prev,
 							   i->sr));
+	/* XRA A is sort of special. Handle it as a mvi of 0 */
+	if (strcasecmp(op, "XRA") == 0 && i->sr == REG_A) {
+		i->prev->need &= ~REG_A;
+		set_reg_value(i->next, REG_A, 0);
+	}
 	if (strcasecmp(op, "XRA") == 0 && know_reg_value(i->prev, i->sr)
 	    && know_reg_value(i->prev, REG_A))
 		set_reg_value(i->next, i->dr,
 			      reg_value(i->prev,
-					REG_A) ^ reg_value(i->next,
+					REG_A) ^ reg_value(i->prev,
 							   i->sr));
 	/* Maths: not yet with carry tracking */
 	if (strcasecmp(op, "ADA") == 0 && know_reg_value(i->prev, i->sr)
 	    && know_reg_value(i->prev, REG_A))
 		set_reg_value(i->next, i->dr,
 			      reg_value(i->prev,
-					REG_A) + reg_value(i->next,
+					REG_A) + reg_value(i->prev,
 							   i->sr));
 	if (strcasecmp(op, "SBA") == 0 && know_reg_value(i->prev, i->sr)
 	    && know_reg_value(i->prev, REG_A))
 		set_reg_value(i->next, i->dr,
 			      reg_value(i->prev,
-					REG_A) - reg_value(i->next,
+					REG_A) - reg_value(i->prev,
 							   i->sr));
 
 	if (i->addrconst != CONST_UNKNOWN) {
@@ -775,8 +814,11 @@ static void parse_instruction(struct instruction *i)
 static void compute_values(void)
 {
 	struct instruction *i = codehead;
+	/* e tracks the previous live registers known, as we need to
+	   ignore any dead stuff when we copy them through */
 	while (i) {
 		int n;
+		compute_effects(i);
 		/* We assume everything at a label is unknown because we can't know
 		   the callers */
 		if (i->label == NULL) {
@@ -784,10 +826,7 @@ static void compute_values(void)
 			for (n = REG_A; n <= REG_L; n++) {
 				if (!(i->next->set & (1 << n))) {
 					if (know_reg_value(i->prev, n))
-						set_reg_value(i->next, n,
-							      reg_value(i->
-									prev,
-									n));
+						set_reg_value(i->next, n, reg_value(i->prev, n));
 				}
 				/* Worth debug checks here if i->next->set is clear but value
 				   already known as it shouldn't happen ?? */
@@ -804,6 +843,46 @@ static void make_op(struct instruction *i, const char *m)
 	i->op = p;
 }
 
+static void eliminate_instruction(struct instruction *i)
+{
+	struct instruction *p;
+
+	printf("Eliminate %p %p\n", (void *)i, (void *)i->prev->prev);
+	/* Find the previous live instruction */
+	p = i->prev->prev;
+
+	/* Unlink ourself but keep our own pointers valid */
+	if (p) {
+		p->next->next = i->next->next;
+		i->next->next->prev = p->next;
+	} else {
+		i->next->next->prev = &dummy_effect;
+	}
+	if (codehead == i)
+		codehead = i->next->next;
+
+	
+	printf("Eliminating %s\n", i->op);
+	i->set = 0;
+	i->dead = 1;
+	i->prev->need = i->next->need;
+
+#if 0
+	/* We are dead, so any values we know are the values our predecessor
+	   knew because we changed nothing - unless they knew because we set
+	   them */
+	for (n = REG_A; n <= REG_L; n++) {
+		if (know_reg_value(p->next, n) && !(i->next->set & (1 << n))) {
+			set_reg_value(i->next, n, reg_value(i->prev, n));
+		} else {
+			clear_reg_value(i->next, n);
+		}
+	}
+#endif	
+	/* We are now a do nothing */
+	i->next->set = 0;
+}
+
 /* We should do this for all the 8bit immediates. We don't bother looking
    for mov a,0 because the compiler is smart enough already */
 static void adjust_immed8(void)
@@ -811,13 +890,27 @@ static void adjust_immed8(void)
 	struct instruction *i = codehead;
 	int r;
 	while (i) {
+		/* Remove anybody who loads a preloaded value */
+		if (i->opinfo->flags & OP_MVI) {
+			if (know_reg_value(i->prev, i->dr) &&
+				reg_value(i->prev, i->dr) == i->addrconst) {
+				eliminate_instruction(i);
+			}
+		}
+		if (i->opinfo->flags & OP_MOV) {
+			if (know_reg_value(i->prev, i->dr) &&
+			    know_reg_value(i->prev, i->sr) && 
+				reg_value(i->prev, i->dr) == reg_value(i->prev, i->sr)) {
+				eliminate_instruction(i);
+			}
+		}
 		/* For each 8bit operation with an immediate source look to see if
 		   we can find the value lurking in a register. For 0, 1 and 255 at
 		   least it's got a fair chance of being there somewhere */
-		if (((i->opinfo->flags & (OP_IMMED | OP_AOP)) ==
+		else if (((i->opinfo->flags & (OP_IMMED | OP_AOP)) ==
 		     (OP_IMMED | OP_AOP)) || (i->opinfo->flags & OP_MVI)) {
-			printf("Candidate %s want %d\n", i->op,
-			       i->addrconst);
+//			printf("Candidate %s want %d\n", i->op,
+//			       i->addrconst);
 			r = find_reg_value(i->prev, i->addrconst);
 			if (r) {
 				i->sr = r;
@@ -830,23 +923,6 @@ static void adjust_immed8(void)
 	}
 }
 
-static void eliminate_instruction(struct instruction *i)
-{
-	int n;
-	/* Merge needs backwards */
-	printf("Eliminating %s\n", i->op);
-	i->set = 0;
-	i->dead = 1;
-	/* We are now a do nothing */
-	i->next->set = 0;
-	i->prev->need = i->next->need;
-	/* We are dead, so any values we know are the values our predecessor
-	   knew because we changed nothing */
-	for (n = REG_A; n <= REG_L; n++) {
-		if (know_reg_value(i->prev, n))
-			set_reg_value(i->next, n, reg_value(i->prev, n));
-	}
-}
 
 /* We walk backwards to propagate need values. A need is copied back until
    a set for it is found. We have some artificial needs on call/ret etc so
@@ -869,10 +945,10 @@ static void propagate_need(void)
 			eliminate_instruction(i);
 		else {
 			/* If not propagate the requirements it had */
-			printf("%s: need was %x now ", i->op,
-			       i->prev->need);
+//			printf("%s: need was %x now ", i->op,
+//			       i->prev->need);
 			i->prev->need |= i->next->need & ~i->next->set;
-			printf("%x\n", i->prev->need);
+//			printf("%x\n", i->prev->need);
 		}
 		i = i->prev->prev;
 	}
@@ -931,17 +1007,21 @@ static void dump_output(void)
 {
 	struct instruction *i = codehead;
 	while (i) {
-		if (!i->dead) {
-			print_regmap(i->prev->need);
-			printf("\n");
-			if (i->label)
-				printf("%s:", i->label->name);
-			printf("%s\n", i->op);
-			print_regmap(i->next->set);
-			printf("\n");
-			print_values(i->next);
-			printf("\n");
-		}
+		if (i->dead)
+			printf("---- BEGIN DEAD ----\n");
+		print_regmap(i->prev->need);
+		printf("\n");
+		if (i->label)
+			printf("%s:", i->label->name);
+		printf("%s\n", i->op);
+		print_regmap(i->next->set);
+		printf("\n");
+		print_values(i->next);
+		printf("\n");
+
+		if (i->dead)
+			printf("----  END DEAD  ----\n");
+		
 		i = i->next->next;
 	}
 }
@@ -978,10 +1058,13 @@ int main(int argc, char *argv[])
 	/* Join all the labels together */
 	/* TODO link_labels(); */
 	/* Set the need flags so we can do unused elimination */
+	printf("Propagate:\n");
 	propagate_need();
 	/* Simple constant propagation */
+	printf("Values:\n");
 	compute_values();
 	/* Constant loads to register for 8bit operations */
+	printf("Immed8:\n");
 	adjust_immed8();
 	/* Look for assignments we can move about and make into pair loads */
 	/* TODO move_assignments(); */
@@ -990,6 +1073,7 @@ int main(int argc, char *argv[])
 	/* Replace the 8080 helpers with ldsi/lhlx */
 	/* TODO eliminate_helpers(); */
 	/* Look for cases we can use ldhi ? */
+	printf("Dump:\n");
 	dump_output();
 	return 0;
 }
